@@ -29,6 +29,12 @@ except ImportError:
     print("Error: exifread is required. Install with: pip install exifread", file=sys.stderr)
     sys.exit(1)
 
+try:
+    import exiv2 as _exiv2_mod
+    getattr(_exiv2_mod, 'enableBMFF', lambda: None)()  # CR3 (ISOBMFF) support
+except ImportError:
+    _exiv2_mod = None  # type: ignore[assignment]
+
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -38,6 +44,9 @@ TARGET_EXTENSIONS: set[str] = {'.nef', '.cr2', '.cr3', '.jpg', '.jpeg'}
 # Extensions that can only come from one maker
 NIKON_ONLY: set[str] = {'.nef'}
 CANON_ONLY: set[str] = {'.cr2', '.cr3'}
+
+# Extensions exifread cannot parse → skip directly to exiv2
+_EXIV2_ONLY: set[str] = {'.cr3'}
 
 # Fragment of EXIF Make tag value → normalized maker folder name
 MAKER_MAP: dict[str, str] = {
@@ -91,9 +100,66 @@ def setup_logging(log_path: Path) -> logging.Logger:
 
 # ── EXIF ──────────────────────────────────────────────────────────────────────
 
+# (make_str, model_str, date_str) – all raw strings, or None if not found
+_RawTags = tuple[str | None, str | None, str | None]
+
+
+def _raw_tags_exifread(file_path: Path) -> _RawTags:
+    """Read Make / Model / DateTime strings via exifread (TIFF-based formats)."""
+    try:
+        with open(file_path, 'rb') as f:
+            tags = exifread.process_file(f, details=False)
+        if not tags:
+            return None, None, None
+        make  = str(tags['Image Make']).strip()  if 'Image Make'  in tags else None
+        model = str(tags['Image Model']).strip() if 'Image Model' in tags else None
+        date_tag = (
+            tags.get('EXIF DateTimeOriginal')
+            or tags.get('EXIF DateTimeDigitized')
+            or tags.get('Image DateTime')
+        )
+        date = str(date_tag).strip() if date_tag else None
+        return make, model, date
+    except Exception:
+        return None, None, None
+
+
+def _raw_tags_exiv2(file_path: Path) -> _RawTags:
+    """Read Make / Model / DateTime strings via exiv2 (fallback for CR3 etc.)."""
+    if _exiv2_mod is None:
+        return None, None, None
+    try:
+        factory = getattr(_exiv2_mod, 'ImageFactory')
+        img = factory.open(str(file_path))
+        img.readMetadata()
+        ed = img.exifData()
+        ExifKey = getattr(_exiv2_mod, 'ExifKey')
+
+        def _get(key: str) -> str | None:
+            pos = ed.findKey(ExifKey(key))
+            if pos == ed.end():
+                return None
+            v = pos.value().toString().strip()
+            return v or None
+
+        make  = _get('Exif.Image.Make')
+        model = _get('Exif.Image.Model')
+        date  = (
+            _get('Exif.Photo.DateTimeOriginal')
+            or _get('Exif.Photo.DateTimeDigitized')
+            or _get('Exif.Image.DateTime')
+        )
+        return make, model, date
+    except Exception:
+        return None, None, None
+
+
 def get_exif_info(file_path: Path) -> tuple[str | None, str | None, datetime | None]:
     """
     Extract maker name, camera folder name, and shooting datetime from EXIF.
+
+    Tries exifread first (fast, TIFF-based formats: NEF/CR2/JPG).
+    Falls back to exiv2 for formats exifread cannot handle (e.g. CR3).
 
     Returns (maker, camera_folder, shoot_dt) where:
         maker         – 'Nikon' or 'Canon' (used for logic checks)
@@ -103,42 +169,31 @@ def get_exif_info(file_path: Path) -> tuple[str | None, str | None, datetime | N
     Returns (None, None, None) if EXIF is missing or maker is unrecognized.
     """
     try:
-        with open(file_path, 'rb') as f:
-            tags = exifread.process_file(f, details=False)
+        if file_path.suffix.lower() in _EXIV2_ONLY:
+            make_raw, model_raw, date_raw = _raw_tags_exiv2(file_path)
+        else:
+            make_raw, model_raw, date_raw = _raw_tags_exifread(file_path)
+            if make_raw is None:
+                make_raw, model_raw, date_raw = _raw_tags_exiv2(file_path)
 
-        if not tags:
-            return None, None, None
-
-        make_tag = tags.get('Image Make')
-        if not make_tag:
+        if not make_raw or not date_raw:
             return None, None, None
 
         maker: str | None = None
         for key, name in MAKER_MAP.items():
-            if key in str(make_tag).strip().lower():
+            if key in make_raw.lower():
                 maker = name
                 break
-
         if not maker:
             return None, None, None
 
-        model_tag = tags.get('Image Model')
-        model_str = normalize_model(maker, str(model_tag).strip() if model_tag else '')
+        model_str = normalize_model(maker, model_raw or '')
 
-        # Build sanitized folder name: {Maker}_{Model}
         camera_folder = sanitize_folder_name(maker)
         if model_str:
             camera_folder = sanitize_folder_name(maker) + '_' + sanitize_folder_name(model_str)
 
-        date_tag = (
-            tags.get('EXIF DateTimeOriginal')
-            or tags.get('EXIF DateTimeDigitized')
-            or tags.get('Image DateTime')
-        )
-        if not date_tag:
-            return None, None, None
-
-        shoot_dt = datetime.strptime(str(date_tag).strip(), '%Y:%m:%d %H:%M:%S')
+        shoot_dt = datetime.strptime(date_raw, '%Y:%m:%d %H:%M:%S')
         return maker, camera_folder, shoot_dt
 
     except Exception:
